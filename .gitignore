@@ -1,0 +1,12 @@
+# Local tooling / caches — never commit.
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+
+# Local runtime state from non-Docker runs.
+data/
+*.db
+*.db-wal
+*.db-shm

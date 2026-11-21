@@ -124,7 +124,10 @@ def create_app(
             f"{settings.min_confirmations}). Reorgs and head rollbacks withdraw "
             "abandoned or insufficiently confirmed transfers, and a late round "
             "can never overwrite a newer published revision. Progress and chain "
-            "view are persisted in SQLite, so a restart resumes following."
+            "view are persisted in SQLite, so a restart resumes following. Each "
+            "round's audit record commits in the same transaction as the view "
+            "it published, so /admin/rounds always shows which instance "
+            "published what — even after a crash."
         ),
         lifespan=lifespan,
     )
@@ -257,8 +260,41 @@ def create_app(
         return report.as_dict()
 
     @app.get("/admin/rounds", tags=["admin"])
-    def rounds(limit: int = Query(default=20, ge=1, le=200)) -> dict[str, Any]:
-        return {"rounds": db.recent_rounds(limit)}
+    def rounds(
+        limit: int = Query(default=20, ge=1, le=200),
+        round_id: str | None = Query(
+            default=None,
+            description=(
+                "Look up the exact round a /admin/sync receipt reported "
+                "(receipt field round_id)"
+            ),
+        ),
+        revision: int | None = Query(
+            default=None,
+            ge=0,
+            description="Only rounds that observed this source revision",
+        ),
+        published: bool | None = Query(
+            default=None,
+            description=(
+                "true: only rounds that actually committed the view; "
+                "false: only rounds that did not"
+            ),
+        ),
+    ) -> dict[str, Any]:
+        """Round audit log.
+
+        Every round that reached the commit point is recorded in the same
+        transaction as the view it published, so a committed round is always
+        findable here — including after a restart.  ``published`` is set on
+        exactly the rounds that committed the view; when two instances race
+        on one revision, only the winner's row has it.
+        """
+        return {
+            "rounds": db.recent_rounds(
+                limit, round_id=round_id, revision=revision, published=published
+            )
+        }
 
     if demo_console:
 
@@ -448,12 +484,19 @@ async function refresh() {
     pill.className = 'pill ' + (v.serving ? 'ok' : 'bad');
     $('view').textContent = JSON.stringify(v, null, 2);
     const rounds = await api('/admin/rounds?limit=6');
-    $('rounds').innerHTML = '<table><tr><th>round</th><th>inst</th><th>outcome</th>' +
-      '<th>obs rev/h</th><th>anc</th><th>fetched/reused</th><th>ms</th></tr>' +
-      rounds.rounds.map(r => `<tr><td>${esc(r.id)}</td><td>${esc(r.instance_id.slice(0,12))}</td>` +
-        `<td>${esc(r.outcome)}</td><td>${r.observed_revision ?? '—'}/${r.observed_height ?? '—'}</td>` +
+    $('rounds').innerHTML = '<table><tr><th>id</th><th>round</th><th>inst</th>' +
+      '<th>outcome</th><th>pub</th><th>obs rev/h</th><th>anc</th>' +
+      '<th>fetched/reused</th><th>start → end</th></tr>' +
+      rounds.rounds.map(r => `<tr><td>${esc(r.id)}</td>` +
+        `<td title="${esc(r.round_id ?? 'pre-receipt row')}">${esc((r.round_id ?? '—').slice(0,8))}</td>` +
+        `<td>${esc(r.instance_id.slice(0,12))}</td>` +
+        `<td>${esc(r.outcome)}</td><td>${r.published ? '✓' : ''}</td>` +
+        `<td>${r.observed_revision ?? '—'}/${r.observed_height ?? '—'}</td>` +
         `<td>${r.ancestor_height ?? '—'}</td><td>${r.fetched_blocks}/${r.reused_blocks}</td>` +
-        `<td>${r.finished_at?.slice(11,19) ?? ''}</td></tr>`).join('') + '</table>';
+        `<td>${(r.started_at ?? '').slice(11,19)} → ${(r.finished_at ?? '').slice(11,19)}</td></tr>`).join('') + '</table>' +
+      '<div class="hint">round = round_id from a sync receipt; ' +
+      'look one up with /admin/rounds?round_id=… — pub ✓ marks the round ' +
+      'that actually committed the view.</div>';
   } catch (e) {
     $('status').textContent = 'error'; $('status').className = 'pill bad';
     $('view').textContent = String(e);

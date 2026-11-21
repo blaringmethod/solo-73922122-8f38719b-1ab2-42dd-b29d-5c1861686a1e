@@ -31,6 +31,12 @@ Demo (UI or curl):
 # force one complete ingestion round (also happens automatically each second)
 curl -X POST http://localhost:8000/admin/sync
 
+# the sync receipt's round_id finds its record; the record commits with the view
+curl 'http://localhost:8000/admin/rounds?round_id=<round_id from the receipt>'
+
+# which instance published the current view?
+curl 'http://localhost:8000/admin/rounds?published=true&limit=1'
+
 # query confirmed transfers for an address
 curl 'http://localhost:8000/transfers?address=addr-alice'
 
@@ -59,7 +65,7 @@ Local (no Docker), Python 3.11+:
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest -q                      # 25 end-to-end tests
+pytest -q                      # 32 end-to-end tests
 
 # terminals 1-3
 SOURCE_STATE_PATH=/tmp/chain-source.json INITIAL_BLOCKS=6 \
@@ -97,19 +103,31 @@ DB_PATH=/tmp/chain.db CHAIN_SOURCE_URL=http://127.0.0.1:9100 INSTANCE_ID=api-b \
   cache first; the published view and progress only change in the final commit.
   Any head/block/validation error leaves the previous view intact and the
   error recorded on `/chain/status` and `/admin/rounds`.
+* **View and round record commit together.** The round's audit row (round id,
+  instance, counts, outcome, `published` flag) is written in the **same
+  transaction** as the view commit. A crash can never leave a publish without
+  its record, and if the history insert fails the whole commit rolls back —
+  the previously published view is served unchanged. Failed and stale rounds
+  are recorded too, with their real start/finish times and the fetch/reuse
+  counts their receipt reports.
 * **No refetch of the known prefix.** The follower walks the two heads down
   `parent_hash` to the common ancestor, cache first. Only changed-suffix blocks
   are fetched; abandoned branches stay cached and are reused if a branch
   returns. Blocks pulled before a crash are reused after restart.
-* **Slow pulls do not block queries.** Normal API handlers are synchronous
-  functions (threadpool), and the follower runs in its own thread on its own
-  SQLite connections. A delayed source only delays the next commit.
+* **Slow pulls do not block queries — or the other replica.** Normal API
+  handlers are synchronous functions (threadpool), and the follower runs in
+  its own thread on its own SQLite connections; no database transaction is
+  held across a source request, so a delayed source only delays the next
+  commit and the second instance can keep syncing meanwhile.
 * **Persisted view + progress, restart-safe.** `sync_state` (published revision,
   head, status, errors) and `chain_blocks` are written together in the same
   transaction. On restart the follower continues from the persisted head.
-* **Two instances, one view.** Both replicas may run the follower. A SQLite
-  lease (renewed during long rounds) elects one active follower at a time, and
-  the revision guard makes concurrent rounds safe regardless of the lease.
+* **Two instances, one view, one publisher per revision.** Both replicas may
+  run the follower. A SQLite lease (renewed during long rounds) elects one
+  active follower at a time, and the revision guard makes concurrent rounds
+  safe regardless of the lease: when both instances process the same
+  revision, the write lock serializes the commits and only the round that
+  actually commits is recorded with `published = 1`.
 
 ## API
 
@@ -119,8 +137,8 @@ DB_PATH=/tmp/chain.db CHAIN_SOURCE_URL=http://127.0.0.1:9100 INSTANCE_ID=api-b \
 | GET    | `/chain/blocks`            | Full published chain view + head basis |
 | GET    | `/chain/status`            | Progress: revision, head, errors, lease, follower state |
 | GET    | `/health`                  | Ops health for Compose |
-| POST   | `/admin/sync`              | Run exactly one round synchronously and report it |
-| GET    | `/admin/rounds`            | Recent round audit log |
+| POST   | `/admin/sync`              | Run exactly one round synchronously and report it (receipt carries `round_id`) |
+| GET    | `/admin/rounds`            | Round audit log; filter by `round_id`, `revision`, `published` |
 | GET    | `/docs`                    | Swagger UI |
 | GET    | `/`                        | Browser demo console |
 
@@ -155,11 +173,17 @@ A transfer is `{txid, from_address, to_address, amount}` with an integer
 * `chain_blocks` — the published canonical height→hash view.
 * `sync_state` — published revision, head, status, last round/error, round count.
 * `ingest_lease` — one active follower across instances.
-* `ingest_rounds` — bounded audit trail (last 500 rounds).
+* `ingest_rounds` — bounded audit trail (last 500 rounds). Each row carries
+  the `round_id` from the sync receipt, the instance, real start/finish
+  times, fetch/reuse counts, the outcome, and a `published` flag set only on
+  the round that actually committed the view. Rows committed by the view
+  transaction appear atomically with it; databases written before round
+  receipts existed are migrated in place (view and history preserved, old
+  `committed` rows backfilled to `published = 1`).
 
 ## Verified behaviour (tests)
 
-`pytest` runs 25 end-to-end tests against real HTTP servers on ephemeral
+`pytest` runs 32 end-to-end tests against real HTTP servers on ephemeral
 ports and a real SQLite file. They cover: the two-block confirmation cutoff and
 that it cannot be lowered; every address seeing the identical complete view;
 reorg suffix-only update with no common-prefix refetch (asserted from
@@ -169,7 +193,13 @@ leaving the published view intact; slow pulls not delaying queries; genuinely
 late rounds rejected after a newer publish; two instances converging from a
 shared volume; restart resuming without refetching; crash-cached blocks reused;
 same-head revision bumps; source state persistence; and `/docs`/console
-availability.
+availability. Round-history tests cover: committed rounds findable by the
+receipt's `round_id` with counts/times matching the receipt; history-insert
+failure rolling the view change back; failed rounds recording their real
+fetch/reuse counts and start time; a restarted instance still showing the
+publish; two instances racing one revision with exactly one `published`
+record (the loser can sync while the winner was still pulling); and in-place
+migration of pre-receipt databases preserving view and history.
 
 ## Known limits
 
@@ -195,7 +225,7 @@ availability.
 
 | Check | Result |
 | --- | --- |
-| `pytest` (25 end-to-end tests, real HTTP servers + real SQLite file) | pass, against both the local environment and the exact pinned Docker dependency set (`PYTHONPATH=/tmp/pins`) |
+| `pytest` (32 end-to-end tests, real HTTP servers + real SQLite file) | pass, against both the local environment and the exact pinned Docker dependency set (`PYTHONPATH=/tmp/pins`) |
 | Both ASGI apps under Uvicorn with pinned deps (`chain_source.main:app`, `app.main:app`) | started, served `/health`, `/docs`, `/`, queries, followed source advances and a fork over real sockets |
 | Two instances sharing one SQLite file | identical `/chain/blocks` views; only one held the lease; failed instance kept serving |
 | Restart continuation | persisted view served before any round; subsequent rounds fetched only new blocks (per-hash counters on the source unchanged for known blocks) |

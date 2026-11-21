@@ -48,6 +48,7 @@ class RoundReport:
     round_id: str
     instance_id: str
     outcome: str
+    started_at: str | None = None
     observed: ObservedHead | None = None
     ancestor_height: int | None = None
     ancestor_hash: str | None = None
@@ -66,6 +67,7 @@ class RoundReport:
             "round_id": self.round_id,
             "instance_id": self.instance_id,
             "outcome": self.outcome,
+            "started_at": self.started_at,
             "observed_head": {
                 "revision": self.observed.revision,
                 "height": self.observed.height,
@@ -199,7 +201,10 @@ class Ingestor:
         self.state["current_round_id"] = round_id
         self.state["rounds_attempted"] += 1
         report = RoundReport(
-            round_id=round_id, instance_id=self.instance_id, outcome="failed"
+            round_id=round_id,
+            instance_id=self.instance_id,
+            outcome="failed",
+            started_at=started_at,
         )
         observed: ObservedHead | None = None
         try:
@@ -240,59 +245,50 @@ class Ingestor:
             report.outcome = "failed"
             self.state["rounds_failed"] += 1
             self.state["last_error"] = str(exc)
-            self._record_failure(str(exc), observed)
+            self._record_failure(str(exc), observed, report)
         except Exception as exc:
             report.error = f"{type(exc).__name__}: {exc}"
             report.outcome = "failed"
             self.state["rounds_failed"] += 1
             self.state["last_error"] = report.error
             log.exception("unexpected ingest failure")
-            self._record_failure(report.error, observed)
+            self._record_failure(report.error, observed, report)
         finally:
             report.duration_ms = int((time.monotonic() - started) * 1000)
-            if report.outcome != "failed":
-                self._log_round(report, started_at)
             self.state["last_round"] = report.as_dict()
             self.state["current_round_id"] = None
         return report
 
-    def _record_failure(self, error: str, observed: ObservedHead | None) -> None:
+    def _record_failure(
+        self, error: str, observed: ObservedHead | None, report: RoundReport
+    ) -> None:
+        """Best-effort failure audit for a round that never reached commit.
+
+        The row carries the round's real start time and the fetch/reuse
+        counts the receipt reports, so a mid-pull failure is auditable as
+        it actually happened.  The published view is not touched.
+        """
         try:
             self.db.record_failure(error[:2000])
         except Exception:
             log.exception("could not record failure state")
         try:
             self.db.log_round(
-                instance_id=self.instance_id,
-                started_at=utcnow(),
+                round_id=report.round_id,
+                instance_id=report.instance_id,
+                started_at=report.started_at or utcnow(),
                 observed=observed,
-                ancestor_height=None,
-                fetched_blocks=0,
-                reused_blocks=0,
+                ancestor_height=report.ancestor_height,
+                fetched_blocks=report.fetched_blocks,
+                reused_blocks=report.reused_blocks,
                 changed_blocks=0,
                 removed_blocks=0,
                 outcome="failed",
+                published=False,
                 error=error,
             )
         except Exception:
             log.exception("could not record failed round")
-
-    def _log_round(self, report: RoundReport, started_at: str) -> None:
-        try:
-            self.db.log_round(
-                instance_id=report.instance_id,
-                started_at=started_at,
-                observed=report.observed,
-                ancestor_height=report.ancestor_height,
-                fetched_blocks=report.fetched_blocks,
-                reused_blocks=report.reused_blocks,
-                changed_blocks=report.changed_blocks,
-                removed_blocks=report.removed_blocks,
-                outcome=report.outcome,
-                error=report.error,
-            )
-        except Exception:
-            log.exception("could not log ingest round")
 
     # --------------------------------------------------------------------- sync
     def _sync_to(self, observed: ObservedHead, report: RoundReport) -> CommitResult:
@@ -301,6 +297,21 @@ class Ingestor:
 
         # Revision guard (also re-checked atomically inside commit_view).
         if has_view and published.published_revision >= observed.revision:
+            # Nothing to commit, but the stale round is still audited with
+            # its real start time and the (zero) work it did.
+            self.db.log_round(
+                round_id=report.round_id,
+                instance_id=report.instance_id,
+                started_at=report.started_at or utcnow(),
+                observed=observed,
+                ancestor_height=None,
+                fetched_blocks=report.fetched_blocks,
+                reused_blocks=report.reused_blocks,
+                changed_blocks=0,
+                removed_blocks=0,
+                outcome="stale",
+                published=False,
+            )
             return CommitResult(
                 published=False,
                 outcome="stale",
@@ -316,6 +327,7 @@ class Ingestor:
             ancestor_height, ancestor_hash, suffix_desc = self._find_ancestor(
                 observed, published, report
             )
+        report.ancestor_height = ancestor_height
         report.ancestor_hash = ancestor_hash
 
         if ancestor_height is not None:
@@ -337,8 +349,19 @@ class Ingestor:
             if suffix_desc[-1].height != 0:
                 raise SourceError("full publish does not reach genesis")
 
+        # The commit writes the round's audit row in the same transaction, so
+        # the receipt's round_id, counts and outcome are exactly what the
+        # history shows — and a history failure aborts the view change too.
         return self.db.commit_view(
-            observed, suffix_desc, ancestor_height, ancestor_hash
+            observed,
+            suffix_desc,
+            ancestor_height,
+            ancestor_hash,
+            round_id=report.round_id,
+            instance_id=report.instance_id,
+            started_at=report.started_at or utcnow(),
+            fetched_blocks=report.fetched_blocks,
+            reused_blocks=report.reused_blocks,
         )
 
     def _collect_suffix_to_genesis(

@@ -173,6 +173,7 @@ INSERT OR IGNORE INTO ingest_lease (id, owner, expires_at) VALUES (1, NULL, 0);
 
 CREATE TABLE IF NOT EXISTS ingest_rounds (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id TEXT,
     instance_id TEXT NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT NOT NULL,
@@ -185,10 +186,17 @@ CREATE TABLE IF NOT EXISTS ingest_rounds (
     changed_blocks INTEGER NOT NULL DEFAULT 0,
     removed_blocks INTEGER NOT NULL DEFAULT 0,
     outcome TEXT NOT NULL,
+    published INTEGER NOT NULL DEFAULT 0,
     error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_rounds_id ON ingest_rounds(id DESC);
+CREATE INDEX IF NOT EXISTS idx_rounds_round_id ON ingest_rounds(round_id);
+CREATE INDEX IF NOT EXISTS idx_rounds_revision ON ingest_rounds(observed_revision);
 """
+
+# The audit trail is bounded so long-running demo deployments do not grow the
+# database without limit; only the newest rounds are kept.
+ROUNDS_RETENTION = 500
 
 
 class Database:
@@ -243,6 +251,9 @@ class Database:
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
+                # Migrate pre-existing tables first so the schema's indexes
+                # find their columns; fresh databases are created by SCHEMA.
+                self._migrate(conn)
                 conn.executescript(SCHEMA)
                 return
             except sqlite3.OperationalError as exc:  # lock contention at boot
@@ -252,6 +263,37 @@ class Database:
                 conn.close()
         assert last_error is not None
         raise last_error
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Upgrade pre-round-history databases in place.
+
+        Existing databases keep their published view and their whole audit
+        trail: the new columns are added with ALTER TABLE, and historical
+        ``committed`` rows are backfilled as ``published = 1`` because a
+        committed round did publish its view.  Rows written before round
+        receipts existed simply have no ``round_id``.  Fresh databases skip
+        this entirely — SCHEMA creates the table with the new columns.
+        """
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'ingest_rounds'"
+        ).fetchone()
+        if exists is None:
+            return
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(ingest_rounds)")
+        }
+        if "round_id" not in columns:
+            conn.execute("ALTER TABLE ingest_rounds ADD COLUMN round_id TEXT")
+        if "published" not in columns:
+            conn.execute(
+                "ALTER TABLE ingest_rounds "
+                "ADD COLUMN published INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute(
+                "UPDATE ingest_rounds SET published = 1 WHERE outcome = 'committed'"
+            )
 
     # --------------------------------------------------------------- block cache
     @staticmethod
@@ -391,30 +433,117 @@ class Database:
             return self._state_row(conn)
 
     # ------------------------------------------------------------------- commit
+    @staticmethod
+    def _insert_round_row(
+        conn: sqlite3.Connection,
+        *,
+        round_id: str | None,
+        instance_id: str,
+        started_at: str,
+        finished_at: str,
+        observed: ObservedHead | None,
+        ancestor_height: int | None,
+        fetched_blocks: int,
+        reused_blocks: int,
+        changed_blocks: int,
+        removed_blocks: int,
+        outcome: str,
+        published: bool,
+        error: str | None,
+    ) -> None:
+        """Insert one audit row and trim the trail to its retention bound.
+
+        Must run inside the caller's transaction so the row's fate is always
+        shared with the view commit it describes.
+        """
+        conn.execute(
+            "INSERT INTO ingest_rounds "
+            "(round_id, instance_id, started_at, finished_at, observed_revision, "
+            "observed_height, observed_hash, ancestor_height, fetched_blocks, "
+            "reused_blocks, changed_blocks, removed_blocks, outcome, published, "
+            "error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                round_id,
+                instance_id,
+                started_at,
+                finished_at,
+                observed.revision if observed else None,
+                observed.height if observed else None,
+                observed.hash if observed else None,
+                ancestor_height,
+                fetched_blocks,
+                reused_blocks,
+                changed_blocks,
+                removed_blocks,
+                outcome,
+                1 if published else 0,
+                error[:2000] if error else None,
+            ),
+        )
+        # Keep the audit table bounded on long-running demo deployments.
+        conn.execute(
+            "DELETE FROM ingest_rounds WHERE id <= "
+            f"(SELECT MAX(id) - {ROUNDS_RETENTION} FROM ingest_rounds)"
+        )
+
     def commit_view(
         self,
         observed: ObservedHead,
         suffix_desc: list[BlockRecord],
         ancestor_height: int | None,
         ancestor_hash: str | None,
+        *,
+        round_id: str,
+        instance_id: str,
+        started_at: str,
+        fetched_blocks: int = 0,
+        reused_blocks: int = 0,
     ) -> CommitResult:
         """Atomically publish a chain view for ``observed``.
 
         ``suffix_desc`` contains only changed-suffix blocks, ordered from the
         observed head downwards.  The caller guarantees the list links back to
         the common ancestor.  The revision guard rejects late rounds.
+
+        The round's audit row is written **in the same transaction** as the
+        view: the published view and its history record always appear
+        together, a crash cannot leave a publish without its record, and if
+        the history insert fails the whole commit rolls back and the
+        previously published view is left untouched.  When two instances race
+        on the same revision, the write lock serializes them and only the
+        round that actually commits is recorded with ``published = 1``.
         """
         if ancestor_height is None and (not suffix_desc or suffix_desc[-1].height != 0):
             raise ValueError("full-chain publish must end at genesis")
         with self._write() as conn:
             state = self._state_row(conn)
             if state.published_revision >= observed.revision:
+                # A newer-or-equal revision is already published: record this
+                # round as stale (with the work it actually did) and change
+                # nothing.  The row commits together with the no-op.
+                self._insert_round_row(
+                    conn,
+                    round_id=round_id,
+                    instance_id=instance_id,
+                    started_at=started_at,
+                    finished_at=utcnow(),
+                    observed=observed,
+                    ancestor_height=ancestor_height,
+                    fetched_blocks=fetched_blocks,
+                    reused_blocks=reused_blocks,
+                    changed_blocks=0,
+                    removed_blocks=0,
+                    outcome="stale",
+                    published=False,
+                    error=None,
+                )
                 return CommitResult(
                     published=False,
                     outcome="stale",
                     ancestor_height=ancestor_height,
                     previous_head_height=state.head_height if state.has_view else None,
-                    changed_blocks=len(suffix_desc),
+                    changed_blocks=0,
                     published_revision=state.published_revision,
                 )
             # A same-height revision bump carries no suffix and no rollback:
@@ -434,6 +563,22 @@ class Database:
                     "last_round_at = ?, last_error = NULL, last_error_at = NULL, "
                     "rounds = rounds + 1 WHERE id = 1",
                     (observed.revision, utcnow()),
+                )
+                self._insert_round_row(
+                    conn,
+                    round_id=round_id,
+                    instance_id=instance_id,
+                    started_at=started_at,
+                    finished_at=utcnow(),
+                    observed=observed,
+                    ancestor_height=ancestor_height,
+                    fetched_blocks=fetched_blocks,
+                    reused_blocks=reused_blocks,
+                    changed_blocks=0,
+                    removed_blocks=0,
+                    outcome="committed",
+                    published=True,
+                    error=None,
                 )
                 return CommitResult(
                     published=True,
@@ -506,6 +651,22 @@ class Database:
                     previous_height
                     - (ancestor_height if ancestor_height is not None else -1),
                 )
+            self._insert_round_row(
+                conn,
+                round_id=round_id,
+                instance_id=instance_id,
+                started_at=started_at,
+                finished_at=utcnow(),
+                observed=observed,
+                ancestor_height=ancestor_height,
+                fetched_blocks=fetched_blocks,
+                reused_blocks=reused_blocks,
+                changed_blocks=len(suffix_desc),
+                removed_blocks=removed,
+                outcome="committed",
+                published=True,
+                error=None,
+            )
             return CommitResult(
                 published=True,
                 outcome="committed",
@@ -538,6 +699,7 @@ class Database:
     def log_round(
         self,
         *,
+        round_id: str | None,
         instance_id: str,
         started_at: str,
         observed: ObservedHead | None,
@@ -547,35 +709,32 @@ class Database:
         changed_blocks: int,
         removed_blocks: int,
         outcome: str,
+        published: bool = False,
         error: str | None = None,
     ) -> None:
+        """Record a round that never reached the view commit.
+
+        Used for failed rounds and for rounds found stale before any fetch;
+        rounds that reach ``commit_view`` are recorded inside the commit
+        transaction instead.  The insert is a single statement, so it is
+        atomic on its own and never touches the published view.
+        """
         with self._write() as conn:
-            conn.execute(
-                "INSERT INTO ingest_rounds "
-                "(instance_id, started_at, finished_at, observed_revision, "
-                "observed_height, observed_hash, ancestor_height, fetched_blocks, "
-                "reused_blocks, changed_blocks, removed_blocks, outcome, error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    instance_id,
-                    started_at,
-                    utcnow(),
-                    observed.revision if observed else None,
-                    observed.height if observed else None,
-                    observed.hash if observed else None,
-                    ancestor_height,
-                    fetched_blocks,
-                    reused_blocks,
-                    changed_blocks,
-                    removed_blocks,
-                    outcome,
-                    error[:2000] if error else None,
-                ),
-            )
-            # Keep the audit table bounded on long-running demo deployments.
-            conn.execute(
-                "DELETE FROM ingest_rounds WHERE id <= "
-                "(SELECT MAX(id) - 500 FROM ingest_rounds)"
+            self._insert_round_row(
+                conn,
+                round_id=round_id,
+                instance_id=instance_id,
+                started_at=started_at,
+                finished_at=utcnow(),
+                observed=observed,
+                ancestor_height=ancestor_height,
+                fetched_blocks=fetched_blocks,
+                reused_blocks=reused_blocks,
+                changed_blocks=changed_blocks,
+                removed_blocks=removed_blocks,
+                outcome=outcome,
+                published=published,
+                error=error,
             )
 
     # -------------------------------------------------------------------- lease
@@ -725,9 +884,31 @@ class Database:
                 view_id=view_id,
             )
 
-    def recent_rounds(self, limit: int = 20) -> list[dict[str, Any]]:
+    def recent_rounds(
+        self,
+        limit: int = 20,
+        *,
+        round_id: str | None = None,
+        revision: int | None = None,
+        published: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """Newest-first audit rows, optionally narrowed to one receipt round,
+        one observed source revision, or only rounds that really committed."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if round_id is not None:
+            clauses.append("round_id = ?")
+            params.append(round_id)
+        if revision is not None:
+            clauses.append("observed_revision = ?")
+            params.append(revision)
+        if published is not None:
+            clauses.append("published = ?")
+            params.append(1 if published else 0)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._read() as conn:
             rows = conn.execute(
-                "SELECT * FROM ingest_rounds ORDER BY id DESC LIMIT ?", (limit,)
+                f"SELECT * FROM ingest_rounds {where} ORDER BY id DESC LIMIT ?",
+                (*params, limit),
             )
             return [dict(r) for r in rows]
